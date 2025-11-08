@@ -59,7 +59,7 @@ NeoPixelBus<NeoGrbFeature, NeoWsMethod> strip(NUM_LEDS, PIN_DATA);
 // ====== RUNTIME STATE ======
 bool showTemperature = false;
 float lastTemperatureC = NAN;        // updated via MQTT
-uint8_t brightness = 255;            // 0..255
+uint8_t brightness = 150;            // 0..255
 RgbColor displayColor(255, 255, 255);// default white
 
 // ====== MQTT/WIFI ======
@@ -68,7 +68,7 @@ PubSubClient mqtt(espClient);
 
 // ====== TIMING ======
 unsigned long lastRenderMs = 0;
-const unsigned long RENDER_INTERVAL_MS = 50;
+const unsigned long RENDER_INTERVAL_MS = 30;
 
 // ====== TIME (Europe/Amsterdam) ======
 // TZ string: CET-1CEST,M3.5.0,M10.5.0/3 (standard EU DST rules)
@@ -86,7 +86,7 @@ int   wipePos   = 0;          // position for color wipe (0..NUM_LEDS-1)
 const uint32_t PULSE_PERIOD_MS = 1800;
 const uint16_t WIPE_SPEED_MS   = 12;   // lower = faster
 const uint16_t RAINBOW_SPEED   = 30;   // hue step per frame
-const uint32_t RAINBOW_FADE_PERIOD_MS = 15000;
+const uint32_t RAINBOW_FADE_PERIOD_MS = 30000;
 
 // Map effect enum <-> name
 const char* effectName(EffectType e) {
