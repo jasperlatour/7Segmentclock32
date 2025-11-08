@@ -37,6 +37,11 @@ const char* DISC_LIGHT_CFG  = "homeassistant/light/led_clock_rgb/config";
 const char* DISC_SWITCH_CFG = "homeassistant/switch/led_clock_showtemp/config";
 const char* DISC_TEMP_CFG   = "homeassistant/sensor/led_clock_temperature/config";
 
+// ---- Effects (MQTT) ----
+const char* TOPIC_CMD_EFFECT   = "led-clock/cmd/effect";     // payload: "Solid","Pulse","Color Wipe","Rainbow"
+const char* TOPIC_EFFECT_STATE = "led-clock/light/effect";   // current effect name
+
+
 // ====== LED STRIP CONFIG (ESP32) ======
 static const uint16_t NUM_LEDS = 142;
 static const uint8_t  PIN_DATA = 4; // GPIO4
@@ -71,6 +76,42 @@ const char* TZ_EU_AMS = "CET-1CEST,M3.5.0,M10.5.0/3";
 const char* NTP1 = "pool.ntp.org";
 const char* NTP2 = "time.nist.gov";
 
+enum EffectType : uint8_t { EFFECT_SOLID, EFFECT_PULSE, EFFECT_COLOR_WIPE, EFFECT_RAINBOW, EFFECT_RAINBOW_FADE };
+volatile EffectType currentEffect = EFFECT_SOLID;
+
+uint32_t effectStartMs = 0;
+uint32_t effectLastMs  = 0;
+float effectMul = 1.0f;       // brightness multiplier for pulse
+int   wipePos   = 0;          // position for color wipe (0..NUM_LEDS-1)
+const uint32_t PULSE_PERIOD_MS = 1800;
+const uint16_t WIPE_SPEED_MS   = 12;   // lower = faster
+const uint16_t RAINBOW_SPEED   = 30;   // hue step per frame
+const uint32_t RAINBOW_FADE_PERIOD_MS = 15000;
+
+// Map effect enum <-> name
+const char* effectName(EffectType e) {
+  switch (e) {
+    case EFFECT_SOLID:        return "Solid";
+    case EFFECT_PULSE:        return "Pulse";
+    case EFFECT_COLOR_WIPE:   return "Color Wipe";
+    case EFFECT_RAINBOW:      return "Rainbow";
+    case EFFECT_RAINBOW_FADE: return "Rainbow Fade";
+  }
+  return "Solid";
+}
+
+EffectType effectFromName(const char* s) {
+  if (!strcasecmp(s, "Pulse"))         return EFFECT_PULSE;
+  if (!strcasecmp(s, "Color Wipe"))    return EFFECT_COLOR_WIPE;
+  if (!strcasecmp(s, "Rainbow"))       return EFFECT_RAINBOW;
+  if (!strcasecmp(s, "Rainbow Fade"))  return EFFECT_RAINBOW_FADE;
+  return EFFECT_SOLID;
+}
+
+void publishEffectState() {
+  mqtt.publish(TOPIC_EFFECT_STATE, effectName(currentEffect), true);
+}
+
 // ====== HELPERS ======
 uint8_t lastNonZeroBrightness = 255;
 
@@ -78,6 +119,58 @@ void applyBrightness(uint8_t b) {
   if (b > 0) lastNonZeroBrightness = b;
   brightness = b;
 }
+
+inline RgbColor hueToRgb(uint16_t hueDeg)
+{
+  // hueDeg 0..359
+  float h = (hueDeg % 360) / 60.0f;   // sector 0..5
+  int i = (int)floor(h);
+  float f = h - i;
+  float p = 0.0f;     // saturation=1, value=1 -> p=0
+  float q = 1.0f - f;
+  float t = f;
+
+  float r_f, g_f, b_f;
+  switch (i % 6) {
+    case 0: r_f = 1.0f; g_f = t;     b_f = p; break;
+    case 1: r_f = q;    g_f = 1.0f;  b_f = p; break;
+    case 2: r_f = p;    g_f = 1.0f;  b_f = t; break;
+    case 3: r_f = p;    g_f = q;     b_f = 1.0f; break;
+    case 4: r_f = t;    g_f = p;     b_f = 1.0f; break;
+    case 5: default: r_f = 1.0f; g_f = p; b_f = q; break;
+  }
+
+  return RgbColor((uint8_t)round(r_f * 255.0f),
+                  (uint8_t)round(g_f * 255.0f),
+                  (uint8_t)round(b_f * 255.0f));
+}
+
+// Hue helper for rainbow
+RgbColor hueAt(uint16_t idx, uint32_t phase)
+{
+  // hue 0..360
+  uint16_t hue = (idx * 3u + phase) % 360u;
+  float h = hue / 60.0f;           // sector 0..5
+  int   i = (int)floor(h);
+  float f = h - i;
+  float p = 0.0f;                  // saturation=1, value=1 -> p=0
+  float q = 1.0f - f;
+  float t = f;
+
+  float r_f, g_f, b_f;
+  switch (i % 6) {
+    case 0: r_f = 1.0f; g_f = t;     b_f = p; break;
+    case 1: r_f = q;    g_f = 1.0f;  b_f = p; break;
+    case 2: r_f = p;    g_f = 1.0f;  b_f = t; break;
+    case 3: r_f = p;    g_f = q;     b_f = 1.0f; break;
+    case 4: r_f = t;    g_f = p;     b_f = 1.0f; break;
+    case 5: default: r_f = 1.0f; g_f = p; b_f = q; break;
+  }
+
+  return RgbColor((uint8_t)round(r_f * 255.0f),
+                  (uint8_t)round(g_f * 255.0f),
+                  (uint8_t)round(b_f * 255.0f));
+} 
 
 void publishLightState() {
   mqtt.publish(TOPIC_LIGHT_STATE, (brightness == 0) ? "OFF" : "ON", true);
@@ -99,18 +192,49 @@ void handlePowerPayload(char* payload)
   publishLightState();
 }
 
-
-
-inline void safeSet(uint16_t idx, const RgbColor& c)
+void handleEffectPayload(char* payload)
 {
-  if (idx < NUM_LEDS) {
-    RgbColor scaled(
-      (uint8_t)((uint16_t)c.R * brightness / 255),
-      (uint8_t)((uint16_t)c.G * brightness / 255),
-      (uint8_t)((uint16_t)c.B * brightness / 255)
-    );
-    strip.SetPixelColor(idx, scaled);
+  currentEffect = effectFromName(payload);
+  effectStartMs = millis();
+  effectLastMs  = effectStartMs;
+  publishEffectState();
+}
+
+inline void safeSet(uint16_t idx, const RgbColor& base)
+{
+  if (idx >= NUM_LEDS) return;
+
+  RgbColor out = base;
+
+  if (currentEffect == EFFECT_RAINBOW) {
+    // moving rainbow across pixels
+    uint32_t phase = ((millis() - effectStartMs) / RAINBOW_SPEED) % 360u;
+    out = hueToRgb((idx * 3u + phase) % 360u);
+  } else if (currentEffect == EFFECT_RAINBOW_FADE) {
+    // single hue for all pixels, slowly changing
+    uint32_t phase = (uint32_t)(((millis() - effectStartMs) % RAINBOW_FADE_PERIOD_MS) * 360ULL / RAINBOW_FADE_PERIOD_MS);
+    out = hueToRgb((uint16_t)phase);
+  } else {
+    // solid/pulse/color-wipe use base color with multiplier
+    uint16_t r = (uint16_t)base.R * effectMul;
+    uint16_t g = (uint16_t)base.G * effectMul;
+    uint16_t b = (uint16_t)base.B * effectMul;
+    out = RgbColor((uint8_t)r, (uint8_t)g, (uint8_t)b);
   }
+
+  // global brightness (0..255)
+  RgbColor scaled(
+    (uint8_t)((uint16_t)out.R * brightness / 255),
+    (uint8_t)((uint16_t)out.G * brightness / 255),
+    (uint8_t)((uint16_t)out.B * brightness / 255)
+  );
+
+  // Color Wipe mask
+  if (currentEffect == EFFECT_COLOR_WIPE && (int)idx > wipePos) {
+    scaled = RgbColor(0);
+  }
+
+  strip.SetPixelColor(idx, scaled);
 }
 
 // Build a stable device/unique_id from MAC
@@ -127,24 +251,27 @@ void publishDiscovery() {
   // ---- LIGHT (optimistic; uses your existing command topics) ----
   // Uses rgb_command_topic with "R,G,B" and brightness_command_topic 0..255
   String lightPayload = "{"
-      "\"name\":\"LED Clock\","
-      "\"unique_id\":\"" + uid + "_light\","
-      "\"command_topic\":\"" + String(TOPIC_CMD_POWER) + "\","
-      "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
-      "\"state_topic\":\"" + String(TOPIC_LIGHT_STATE) + "\","
-      "\"brightness_command_topic\":\"" + String(TOPIC_CMD_BRIGHTNESS) + "\","
-      "\"brightness_state_topic\":\"" + String(TOPIC_BRIGHT_STATE) + "\","
-      "\"brightness_scale\":255,"
-      "\"rgb_command_topic\":\"" + String(TOPIC_CMD_COLOR) + "\","
-      "\"rgb_state_topic\":\"" + String(TOPIC_RGB_STATE) + "\","
-      "\"availability_topic\":\"" + String(TOPIC_STATE_ONLINE) + "\","
-      "\"payload_available\":\"online\","
-      "\"payload_not_available\":\"offline\","
-      "\"optimistic\":false,"
-      "\"device\":{"
-        "\"identifiers\":[\"" + uid + "\"],"
-        "\"name\":\"LED Clock\",\"model\":\"ESP32 LED 7-seg Clock\",\"manufacturer\":\"Custom\"}"
-    "}";
+    "\"name\":\"LED Clock\","
+    "\"unique_id\":\"" + uid + "_light\","
+    "\"command_topic\":\"" + String(TOPIC_CMD_POWER) + "\","
+    "\"payload_on\":\"ON\",\"payload_off\":\"OFF\","
+    "\"state_topic\":\"" + String(TOPIC_LIGHT_STATE) + "\","
+    "\"brightness_command_topic\":\"" + String(TOPIC_CMD_BRIGHTNESS) + "\","
+    "\"brightness_state_topic\":\"" + String(TOPIC_BRIGHT_STATE) + "\","
+    "\"brightness_scale\":255,"
+    "\"rgb_command_topic\":\"" + String(TOPIC_CMD_COLOR) + "\","
+    "\"rgb_state_topic\":\"" + String(TOPIC_RGB_STATE) + "\","
+    "\"effect_command_topic\":\"" + String(TOPIC_CMD_EFFECT) + "\","
+    "\"effect_state_topic\":\"" + String(TOPIC_EFFECT_STATE) + "\","
+    "\"effect_list\":[\"Solid\",\"Pulse\",\"Color Wipe\",\"Rainbow\",\"Rainbow Fade\"],"
+    "\"availability_topic\":\"" + String(TOPIC_STATE_ONLINE) + "\","
+    "\"payload_available\":\"online\","
+    "\"payload_not_available\":\"offline\","
+    "\"optimistic\":false,"
+    "\"device\":{"
+      "\"identifiers\":[\"" + uid + "\"],"
+      "\"name\":\"LED Clock\",\"model\":\"ESP32 LED 7-seg Clock\",\"manufacturer\":\"Custom\"}"
+  "}";
 
   // ---- SWITCH (show temperature) ----
   String switchPayload = "{"
@@ -165,27 +292,27 @@ void publishDiscovery() {
   "}";
 
   // ---- SENSOR (temperature °C) ----
-String numberPayload = "{"
-  "\"name\":\"Clock Temperature\","
-  "\"unique_id\":\"" + uid + "_temp_set\","
-  "\"command_topic\":\"" + String(TOPIC_TEMPERATURE) + "\","
-  "\"state_topic\":\"" + String(TOPIC_TEMPERATURE) + "\","
-  "\"min\":-20,\"max\":50,\"step\":0.1,"
-  "\"unit_of_measurement\":\"°C\","
-  "\"device_class\":\"temperature\","
-  "\"mode\":\"box\","
-  "\"availability_topic\":\"" + String(TOPIC_STATE_ONLINE) + "\","
-  "\"payload_available\":\"online\","
-  "\"payload_not_available\":\"offline\","
-  "\"device\":{"
-    "\"identifiers\":[\"" + uid + "\"],"
-    "\"name\":\"LED Clock\",\"model\":\"ESP32 LED 7-seg Clock\",\"manufacturer\":\"Custom\"}"
-"}";
+  String numberPayload = "{"
+    "\"name\":\"Clock Temperature\","
+    "\"unique_id\":\"" + uid + "_temp_set\","
+    "\"command_topic\":\"" + String(TOPIC_TEMPERATURE) + "\","
+    "\"state_topic\":\"" + String(TOPIC_TEMPERATURE) + "\","
+    "\"min\":-20,\"max\":50,\"step\":0.1,"
+    "\"unit_of_measurement\":\"°C\","
+    "\"device_class\":\"temperature\","
+    "\"mode\":\"box\","
+    "\"availability_topic\":\"" + String(TOPIC_STATE_ONLINE) + "\","
+    "\"payload_available\":\"online\","
+    "\"payload_not_available\":\"offline\","
+    "\"device\":{"
+      "\"identifiers\":[\"" + uid + "\"],"
+      "\"name\":\"LED Clock\",\"model\":\"ESP32 LED 7-seg Clock\",\"manufacturer\":\"Custom\"}"
+  "}";
 
-  mqtt.publish(DISC_LIGHT_CFG,  lightPayload.c_str(),  true);
-  mqtt.publish(DISC_SWITCH_CFG, switchPayload.c_str(), true);
-  mqtt.publish("homeassistant/number/led_clock_temperature/config", numberPayload.c_str(), true);
-}
+    mqtt.publish(DISC_LIGHT_CFG,  lightPayload.c_str(),  true);
+    mqtt.publish(DISC_SWITCH_CFG, switchPayload.c_str(), true);
+    mqtt.publish("homeassistant/number/led_clock_temperature/config", numberPayload.c_str(), true);
+  }
 
 const bool seg_on[10][7] = {
   { true,  true,  true,  true,  true,  true,  false},  // 0
@@ -203,7 +330,9 @@ const bool seg_on[10][7] = {
 // each segment is a block of 5 LEDs; segments are laid out consecutively
 void drawSegmentBlock(int start, const RgbColor& col)
 {
-  for (int i = start; i < start + 5; i++) safeSet(i, col);
+  for (int i = start; i < start + 5; i++) {
+    safeSet(i, col);
+  }
 }
 
 void drawDigit(int digit, int offset, const RgbColor& col)
@@ -232,6 +361,46 @@ bool getLocalTimeSafe(struct tm* info)
   if (now < 8 * 3600 * 2) return false; // crude "time not set" guard
   localtime_r(&now, info);
   return true;
+}
+
+
+
+void updateEffect()
+{
+  uint32_t now = millis();
+  uint32_t dt  = now - effectLastMs;
+  effectLastMs = now;
+
+  switch (currentEffect) {
+    case EFFECT_SOLID:
+      effectMul = 1.0f;
+      break;
+
+    case EFFECT_PULSE: {
+      float phase = (float)(now - effectStartMs) / (float)PULSE_PERIOD_MS;
+      float s = 0.5f * (sinf(phase * 2.0f * PI) + 1.0f); // 0..1
+      effectMul = 0.3f + 0.7f * s;
+      break;
+    }
+
+    case EFFECT_COLOR_WIPE:
+      if (dt >= WIPE_SPEED_MS) {
+        wipePos += (dt / WIPE_SPEED_MS);
+        if (wipePos >= (int)NUM_LEDS) { wipePos = 0; effectStartMs = now; }
+      }
+      effectMul = 1.0f;
+      break;
+
+    case EFFECT_RAINBOW:
+      // per-pixel handled in safeSet()
+      effectMul = 1.0f;
+      break;
+
+    case EFFECT_RAINBOW_FADE:
+      // global hue handled in safeSet(); we just keep the clock running
+      effectMul = 1.0f;
+      break;
+  }
 }
 
 // ====== MQTT CALLBACK ======
@@ -274,11 +443,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
   unsigned int len = min(length, (unsigned int)(sizeof(buf)-1));
   memcpy(buf, payload, len); buf[len] = '\0';
 
-  if (!strcmp(topic, TOPIC_CMD_POWER))          handlePowerPayload(buf);
-  else if (!strcmp(topic, TOPIC_CMD_COLOR))     handleColorPayload(buf);
-  else if (!strcmp(topic, TOPIC_CMD_BRIGHTNESS))handleBrightnessPayload(buf);
-  else if (!strcmp(topic, TOPIC_CMD_SHOW_TEMP)) handleShowTempPayload(buf);
-  else if (!strcmp(topic, TOPIC_TEMPERATURE))   handleTemperaturePayload(buf);
+  if (!strcmp(topic, TOPIC_CMD_POWER))            handlePowerPayload(buf);
+  else if (!strcmp(topic, TOPIC_CMD_COLOR))       handleColorPayload(buf);
+  else if (!strcmp(topic, TOPIC_CMD_BRIGHTNESS))  handleBrightnessPayload(buf);
+  else if (!strcmp(topic, TOPIC_CMD_SHOW_TEMP))   handleShowTempPayload(buf);
+  else if (!strcmp(topic, TOPIC_TEMPERATURE))     handleTemperaturePayload(buf);
+  else if (!strcmp(topic, TOPIC_CMD_EFFECT))      handleEffectPayload(buf); // <---
 }
 
 // ====== CONNECT WIFI & MQTT ======
@@ -316,8 +486,9 @@ void connectMQTT()
       mqtt.subscribe(TOPIC_CMD_BRIGHTNESS);
       mqtt.subscribe(TOPIC_CMD_SHOW_TEMP);
       mqtt.subscribe(TOPIC_TEMPERATURE);
+      mqtt.subscribe(TOPIC_CMD_EFFECT);
 
-      publishDiscovery(); // <--- add this
+      publishDiscovery(); 
     } else {
       delay(1000);
     }
@@ -345,6 +516,7 @@ void setup()
   delay(500); // let things settle
   mqtt.publish(TOPIC_STATE_ONLINE, "online", true);
   publishLightState();
+  publishEffectState(); 
   mqtt.publish(TOPIC_STATE_SHOW_TEMP, showTemperature ? "ON" : "OFF", true);
 }
 
@@ -416,6 +588,7 @@ void loop()
   unsigned long now = millis();
   if (now - lastRenderMs >= RENDER_INTERVAL_MS) {
     lastRenderMs = now;
+      updateEffect();
     if (showTemperature) {
       renderTemperature();
     } else {
