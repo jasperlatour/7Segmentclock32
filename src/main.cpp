@@ -7,8 +7,8 @@
 #include <ctype.h>
 
 // ====== WiFi & MQTT CONFIG ======
-const char* WIFI_SSID     = "LatourNet";
-const char* WIFI_PASSWORD = "Brandevoort11";
+const char* WIFI_SSID     = "ssid";
+const char* WIFI_PASSWORD = "password";
 
 const char* MQTT_HOST     = "192.168.1.182";   // broker IP/host
 const uint16_t MQTT_PORT  = 1883;
